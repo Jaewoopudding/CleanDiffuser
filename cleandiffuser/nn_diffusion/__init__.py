@@ -9,3 +9,4 @@ from .pearcetransformer import PearceTransformer
 from .pearcemlp import PearceMlp
 from .dqlmlp import DQLMlp
 from .idqlmlp import IDQLMlp
+from .mixerunet import MixerUnet
