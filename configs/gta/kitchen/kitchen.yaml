@@ -1,16 +1,13 @@
 defaults:
   - _self_
-  - task: halfcheetah-medium-expert-v2
+  - task: kitchen-mixed-v0
 
-pipeline_name: gta_d4rl_mujoco
+pipeline_name: gta_d4rl_kitchen
 mode: inference
 seed: 0
 device: cuda:0
 
-# Environment
-normalize_reward: True
-
-# SynthER
+# Actor
 solver: ddpm
 diffusion_steps: 128
 sampling_steps: 128

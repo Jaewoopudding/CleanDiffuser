@@ -3,20 +3,25 @@ defaults:
   - task: halfcheetah-medium-expert-v2
 
 pipeline_name: gta_d4rl_mujoco
-mode: inference
+mode: train_diffusion
 seed: 0
 device: cuda:0
 
 # Environment
 normalize_reward: True
+terminal_penalty: -100
+discount: 0.99
 
 # SynthER
 solver: ddpm
 diffusion_steps: 128
 sampling_steps: 128
+embed_dim: 32
+model_dim: 16
 predict_noise: True
 ema_rate: 0.999
 diffusion_learning_rate: 0.0003
+label_dropout: 0.25
 
 # Diffusion Training
 diffusion_gradient_steps: 200000

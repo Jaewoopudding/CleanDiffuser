@@ -1,14 +1,11 @@
 defaults:
   - _self_
-  - task: halfcheetah-medium-expert-v2
+  - task: antmaze-medium-play-v2
 
-pipeline_name: gta_d4rl_mujoco
+pipeline_name: gta_d4rl_antmaze
 mode: inference
 seed: 0
 device: cuda:0
-
-# Environment
-normalize_reward: True
 
 # SynthER
 solver: ddpm
