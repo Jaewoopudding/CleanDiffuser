@@ -5,7 +5,7 @@ import numbers
 import zarr
 import numcodecs
 import numpy as np
-from functools import cached_property
+# from functools import cached_property
 
 def check_chunks_compatible(chunks: tuple, shape: tuple):
     assert len(shape) == len(chunks)
@@ -333,11 +333,11 @@ class ReplayBuffer:
         return cks
     
     # ============= properties =================
-    @cached_property
+    # @cached_property
     def data(self):
         return self.root['data']
     
-    @cached_property
+    # @cached_property
     def meta(self):
         return self.root['meta']
 
