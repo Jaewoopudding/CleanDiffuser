@@ -93,7 +93,8 @@ class D4RLMuJoCoDataset(BaseDataset):
             'obs': {
                 'state': self.seq_obs[path_idx, start:end]},
             'act': self.seq_act[path_idx, start:end],
-            'val': values}
+            'val': values,
+            'rew': self.seq_rew[path_idx, start:end]}
 
         torch_data = dict_apply(data, torch.from_numpy)
 
