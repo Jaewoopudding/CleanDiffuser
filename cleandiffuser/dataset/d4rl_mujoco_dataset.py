@@ -56,6 +56,7 @@ class D4RLMuJoCoDataset(BaseDataset):
         self.seq_obs = np.zeros((n_paths, max_path_length, self.o_dim), dtype=np.float32)
         self.seq_act = np.zeros((n_paths, max_path_length, self.a_dim), dtype=np.float32)
         self.seq_rew = np.zeros((n_paths, max_path_length, 1), dtype=np.float32)
+        self.seq_tml = np.zeros((n_paths, max_path_length, 1), dtype=np.float32)
         self.indices = []
 
         path_lengths, ptr = [], 0
@@ -70,6 +71,7 @@ class D4RLMuJoCoDataset(BaseDataset):
                 self.seq_obs[path_idx, :i - ptr + 1] = normed_observations[ptr:i + 1]
                 self.seq_act[path_idx, :i - ptr + 1] = actions[ptr:i + 1]
                 self.seq_rew[path_idx, :i - ptr + 1] = rewards[ptr:i + 1][:, None]
+                self.seq_tml[path_idx, :i - ptr + 1] = terminals[ptr:i + 1][:, None] ## tml timeout ?? 
 
                 max_start = min(path_lengths[-1] - 1, max_path_length - horizon)
                 self.indices += [(path_idx, start, start + horizon) for start in range(max_start + 1)]
@@ -94,7 +96,8 @@ class D4RLMuJoCoDataset(BaseDataset):
                 'state': self.seq_obs[path_idx, start:end]},
             'act': self.seq_act[path_idx, start:end],
             'val': values,
-            'rew': self.seq_rew[path_idx, start:end]}
+            'rew': self.seq_rew[path_idx, start:end],
+            'tml': self.seq_tml[path_idx, start:end]}
 
         torch_data = dict_apply(data, torch.from_numpy)
 
