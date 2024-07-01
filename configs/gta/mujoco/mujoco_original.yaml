@@ -2,10 +2,10 @@ defaults:
   - _self_
   - task: halfcheetah-medium-expert-v2
 
-pipeline_name: gta_d4rl_mujoco_trial
-mode: dataset_upsampling
+pipeline_name: gta_d4rl_mujoco
+mode: train_diffusion
 seed: 0
-device: cuda:1
+device: cuda:0
 
 # Environment
 normalize_reward: True
@@ -22,17 +22,17 @@ predict_noise: True
 ema_rate: 0.999
 diffusion_learning_rate: 0.0003
 label_dropout: 0.25
-augmentation_size: 5000
+augmentation_size: 5000000
 
 # Diffusion Training
-diffusion_gradient_steps: 100
+diffusion_gradient_steps: 200000
 batch_size: 256
-log_interval: 10
-save_interval: 80
+log_interval: 1000
+save_interval: 100000
 
 ## Classifier Free Guidance
-w_cfg: 2.0
-temperature: 1.0
+w_cfg: 9999
+temperature: 9999
 
 # RL Training
 rl_gradient_steps: 1000000

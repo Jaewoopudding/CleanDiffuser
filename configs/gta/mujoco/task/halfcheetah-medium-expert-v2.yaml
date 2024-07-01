@@ -1,2 +1,4 @@
 env_name: "halfcheetah-medium-expert-v2"
 horizon: 32
+noise_level: 0.5
+amplified_return_coef: 1.3
