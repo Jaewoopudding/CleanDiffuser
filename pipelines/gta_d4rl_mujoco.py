@@ -23,7 +23,7 @@ from utils import set_seed
 #################################
 from tqdm import tqdm
 
-
+## TODO NEWDATASET CLASS D4RLMuJoCoDataset
 class GTAD4RLMuJoCoTDDataset(D4RLMuJoCoTDDataset):
     def __init__(self, save_path, dataset, normalize_reward: bool = False):
         super().__init__(dataset, normalize_reward)
@@ -212,11 +212,11 @@ def pipeline(args):
 
     # ---------------------- Create Dataset ----------------------
     env = gym.make(args.task.env_name)
-    # dataset = D4RLMuJoCoTDDataset(d4rl.qlearning_dataset(env), args.normalize_reward) ## TODO normalize reward
+    # dataset = D4RLMuJoCoTDDataset(d4rl.qlearning_dataset(env), args.normalize_reward) ## TODO normalize reward -- IQL !!
     dataset = D4RLMuJoCoDataset(
         env.get_dataset(), horizon=args.task.horizon, terminal_penalty=args.terminal_penalty, discount=args.discount)
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+        dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)    
     obs_dim, act_dim = dataset.o_dim, dataset.a_dim
 
     # --------------- Network Architecture -----------------
@@ -224,11 +224,8 @@ def pipeline(args):
         horizon=args.task.horizon,
         d_in=(obs_dim + act_dim + 1), # obs + act + rew
         embed_dim=args.embed_dim,
-        model_dim=args.model_dim, ## TODO must be hyperparameter
+        model_dim=args.model_dim,
         cond_dim=1,
-        # condition_dropout=args.label_dropout, ##TODO conditioning 조건이 다르기 때문에 유의해야 한다. 
-        # use_dropout=True,
-        # force_dropout=False,
         timestep_emb_type="fourier"
     )
     
@@ -243,7 +240,7 @@ def pipeline(args):
     # --------------- Diffusion Model Actor --------------------
     gta = DiscreteDiffusionSDE( ### Mixer 아키텍처가 DDSDE 안으로 들어가 버리면서 conditioning 하는 방법이 바뀌어 버림. -> log["avg_diffusion_loss"] += gta.update(x, val)["loss"]
         nn_diffusion, nn_condition, predict_noise=args.predict_noise, optim_params={"lr": args.diffusion_learning_rate},
-        diffusion_steps=args.diffusion_steps, ema_rate=args.ema_rate, device=args.device)
+        diffusion_steps=args.diffusion_steps, ema_rate=args.ema_rate, device=args.device) ## TODO (후순위) DDPM -> EDM
 
     # ---------------------- Diffusion Training ----------------------
     if args.mode == "train_diffusion":
@@ -266,8 +263,8 @@ def pipeline(args):
             
             obs = batch["obs"]["state"].to(args.device)
             act = batch["act"].to(args.device)
-            rew = batch['rew'].to(args.device)
-            val = batch["val"].to(args.device) ## TODO val 이 bernoulli에 의해서 drop 되어야 하는가? Ans : NO! 알고보니, diffusionsde의 model forward 입력과 mixerunet의 입력순서가 동일해서 이상무
+            rew = batch["rew"].to(args.device)
+            val = batch["val"].to(args.device) ## val 이 bernoulli에 의해서 drop 되어야 하는가? Ans : NO! 알고보니, diffusionsde의 model forward 입력과 mixerunet의 입력순서가 동일해서 이상무
 
             x = torch.cat([obs, act, rew], -1)
 
@@ -296,25 +293,62 @@ def pipeline(args):
 
         gta.load(save_path + f"diffusion_ckpt_{args.ckpt}.pt")
         gta.eval()
-
-        ori_size = dataset.obs.shape[0]
-        syn_size = 5000000 - ori_size
-
+        
+        dataloader = DataLoader(
+            dataset, batch_size=1000, shuffle=True, num_workers=4, pin_memory=True, drop_last=True ## TODO reweighted sampler 
+        )
+        augmentation_sizes = args.augmentation_size
         extra_transitions = []
-        prior = torch.zeros((100000, 2 * obs_dim + act_dim + 2)).to(args.device)
-        for _ in tqdm(range(syn_size // 100000)):
-            syn_transitions, _ = gta.sample(
-                prior, solver=args.solver, n_samples=100000, sample_steps=args.sampling_steps, use_ema=args.use_ema)
-            extra_transitions.append(syn_transitions.cpu().numpy())
-
-        syn_transitions, _ = gta.sample(
-            torch.zeros((syn_size % 100000, 2 * obs_dim + act_dim + 2)).to(args.device),
-            n_samples=syn_size % 100000, sample_steps=args.sampling_steps, use_ema=args.use_ema, solver=args.solver)
-        extra_transitions.append(syn_transitions.cpu().numpy())
+        extra_transitions_count = 0
+        # syn_size = args.augmentation_size
+        prior = torch.zeros((1000, args.task.horizon, obs_dim + act_dim + 1)).to(args.device)
+        for batch in loop_dataloader(dataloader):
+            obs = batch["obs"]["state"].to(args.device)
+            act = batch["act"].to(args.device)
+            rew = batch["rew"].to(args.device)
+            val = batch["val"].to(args.device)
+            tml = batch["tml"].to(args.device)
+            condition = val * args.task.amplified_return_coef
+            
+            original_trajectory = torch.cat([obs, act, rew], -1) # 1000, horizon, obs+act+rew
+            augmented_trajectories, _ = gta.sample(
+                            prior, solver=args.solver, n_samples=1000, sample_steps=args.sampling_steps, use_ema=args.use_ema,
+                            warm_start_forward_level=args.task.noise_level, warm_start_reference=original_trajectory,
+                            condition_cfg=condition, w_cfg=args.w_cfg, temperature=args.temperature
+                        )
+            augmented_transitions = torch.cat([
+                augmented_trajectories[:, :-1, :], 
+                augmented_trajectories[:, 1:,  :obs_dim],
+                tml[:, :-1, :]], -1).reshape(-1, 2 * obs_dim + act_dim + 2)
+            
+            extra_transitions_count += augmented_transitions.shape[0]
+            if extra_transitions_count >= augmentation_sizes:
+                extra_transitions.append(augmented_transitions[:augmented_transitions.shape[0] - (extra_transitions_count - augmentation_sizes), :].cpu().numpy())
+                break
+            else:
+                extra_transitions.append(augmented_transitions.cpu().numpy())
         extra_transitions = np.concatenate(extra_transitions, 0)
-
         np.save(save_path + "extra_transitions.npy", extra_transitions)
         print(f'Finish.')
+        
+        # extra_transitions = []
+        # prior = torch.zeros((100000, 2 * obs_dim + act_dim + 2)).to(args.device)
+        # for _ in tqdm(range(syn_size // 100000)):
+        #     syn_transitions, _ = gta.sample(
+        #         prior, solver=args.solver, n_samples=100000, sample_steps=args.sampling_steps, use_ema=args.use_ema)
+            
+            
+        #     extra_transitions.append(syn_transitions.cpu().numpy())
+
+        # syn_transitions, _ = gta.sample(
+        #     torch.zeros((syn_size % 100000, 2 * obs_dim + act_dim + 2)).to(args.device),
+        #     n_samples=syn_size % 100000, sample_steps=args.sampling_steps, use_ema=args.use_ema, solver=args.solver)
+        # extra_transitions.append(syn_transitions.cpu().numpy())
+        # extra_transitions = np.concatenate(extra_transitions, 0)
+
+        # np.save(save_path + "extra_transitions.npy", extra_transitions)
+        # print(f'Finish.')
+        
 
     # --------------------- Train RL ------------------------
     elif args.mode == "train_rl":
