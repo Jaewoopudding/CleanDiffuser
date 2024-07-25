@@ -92,7 +92,7 @@ class BaseDiffusionSDE(DiffusionModel):
         raise NotImplementedError
 
     def loss(self, x0, condition=None):
-
+        
         xt, t, eps = self.add_noise(x0)
 
         condition = self.model["condition"](condition) if condition is not None else None
@@ -388,6 +388,21 @@ class DiscreteDiffusionSDE(BaseDiffusionSDE):
         xt = (1. - self.fix_mask) * xt + self.fix_mask * x0
 
         return xt, t, eps
+
+
+    def loss(self, x0, condition=None):
+        
+        xt, t, eps = self.add_noise(x0)
+        self.loss_weight = self.loss_weight.view(xt.shape)
+
+        condition = self.model["condition"](condition) if condition is not None else None
+
+        if self.predict_noise:
+            loss = (self.model["diffusion"](xt, t, condition) - eps) ** 2
+        else:
+            loss = (self.model["diffusion"](xt, t, condition) - x0) ** 2
+
+        return (loss * self.loss_weight * (1 - self.fix_mask)).mean()
 
     # ==================== Sampling: Solving SDE/ODE ======================
 
@@ -716,7 +731,7 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
     # ==================== Training: Score Matching ======================
 
     def add_noise(self, x0, t=None, eps=None):
-
+        
         t = (torch.rand((x0.shape[0],), device=self.device) *
              (self.t_diffusion[1] - self.t_diffusion[0]) + self.t_diffusion[0]) if t is None else t
 

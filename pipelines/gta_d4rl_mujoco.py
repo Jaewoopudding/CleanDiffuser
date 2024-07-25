@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from cleandiffuser.dataset.d4rl_mujoco_dataset import D4RLMuJoCoTDDataset, D4RLMuJoCoDataset
@@ -18,12 +18,93 @@ from cleandiffuser.diffusion import DiscreteDiffusionSDE
 from cleandiffuser.nn_diffusion import MixerUnet
 from cleandiffuser.nn_condition import MLPCondition
 from cleandiffuser.utils import report_parameters, FreezeModules
+from cleandiffuser.dataset.dataset_utils import GaussianNormalizer, dict_apply
 from utils import set_seed
 
 #################################
 from tqdm import tqdm
 
 ## TODO NEWDATASET CLASS D4RLMuJoCoDataset
+
+class GTAD4RLMuJoCoDiffusionDataset(D4RLMuJoCoDataset):
+    def __init__(self, dataset, terminal_penalty=-100, horizon=1, max_path_length=1000, discount=0.99):
+        super().__init__(dataset, terminal_penalty, horizon, max_path_length, discount)
+
+        
+        observations, actions, rewards, next_observations, timeouts, terminals = (
+            dataset["observations"].astype(np.float32),
+            dataset["actions"].astype(np.float32),
+            dataset["rewards"].astype(np.float32),
+            dataset["next_observations"].astype(np.float32),
+            dataset["timeouts"],
+            dataset["terminals"])
+        self.normalizers = {
+            "state": GaussianNormalizer(observations),
+            "next_state": GaussianNormalizer(observations)
+            }
+        normed_observations = self.normalizers["state"].normalize(observations)
+        normed_next_observations = self.normalizers["next_state"].normalize(next_observations)
+
+        self.horizon = horizon
+        self.o_dim, self.a_dim = observations.shape[-1], actions.shape[-1]
+        self.discount = discount ** np.arange(max_path_length, dtype=np.float32)
+
+        n_paths = np.sum(np.logical_or(terminals, timeouts))
+        self.seq_obs = np.zeros((n_paths, max_path_length, self.o_dim), dtype=np.float32)
+        self.seq_next_obs = np.zeros((n_paths, max_path_length, self.o_dim), dtype=np.float32)
+        self.seq_act = np.zeros((n_paths, max_path_length, self.a_dim), dtype=np.float32)
+        self.seq_rew = np.zeros((n_paths, max_path_length, 1), dtype=np.float32)
+        self.seq_tml = np.zeros((n_paths, max_path_length, 1), dtype=np.float32)
+        self.indices = []
+
+        path_lengths, ptr = [], 0
+        path_idx = 0
+        for i in range(timeouts.shape[0]):
+            if timeouts[i] or terminals[i]:
+                path_lengths.append(i - ptr + 1)
+
+                if terminals[i] and not timeouts[i]:
+                    rewards[i] = terminal_penalty if terminal_penalty is not None else rewards[i]
+
+                self.seq_obs[path_idx, :i - ptr + 1] = normed_observations[ptr:i + 1]
+                self.seq_next_obs[path_idx, :i - ptr + 1] = normed_next_observations[ptr:i + 1]
+                self.seq_act[path_idx, :i - ptr + 1] = actions[ptr:i + 1]
+                self.seq_rew[path_idx, :i - ptr + 1] = rewards[ptr:i + 1][:, None]
+                self.seq_tml[path_idx, :i - ptr + 1] = terminals[ptr:i + 1][:, None] ## tml timeout ?? 
+
+                max_start = min(path_lengths[-1] - 1, max_path_length - horizon)
+                self.indices += [(path_idx, start, start + horizon) for start in range(max_start + 1)]
+
+                ptr = i + 1
+                path_idx += 1
+    # self.trajectory return for weighted sampler
+    
+
+
+
+    def __getitem__(self, idx: int):
+        path_idx, start, end = self.indices[idx]
+
+        rewards = self.seq_rew[path_idx, start:]
+        values = (rewards * self.discount[:rewards.shape[0], None]).sum(0)
+
+        data = {
+            'obs': {
+                'state': self.seq_obs[path_idx, start:end]},
+            'act': self.seq_act[path_idx, start:end],
+            'val': values,
+            'rew': self.seq_rew[path_idx, start:end],
+            'tml': self.seq_tml[path_idx, start:end],
+            'next_obs': {
+                'state': self.seq_next_obs[path_idx, start:end]}
+                }
+
+        torch_data = dict_apply(data, torch.from_numpy)
+
+        return torch_data
+
+
+
 class GTAD4RLMuJoCoTDDataset(D4RLMuJoCoTDDataset):
     def __init__(self, save_path, dataset, normalize_reward: bool = False):
         super().__init__(dataset, normalize_reward)
@@ -59,6 +140,35 @@ class GTAD4RLMuJoCoTDDataset(D4RLMuJoCoTDDataset):
         self.next_obs = torch.from_numpy(normed_next_observations)
 
         self.size = self.obs.shape[0]
+
+
+def ddom_reweighting(trajectory_returns,
+                     reward_scale = 0.01,
+                     bins = 50,
+                     u=1e-4,
+                     q=5.0,
+                     max_weight = 5.0):
+    trajectory_returns *= reward_scale
+    bins = int(bins)
+    hist, bin_edges = np.histogram(trajectory_returns, bins=bins)
+    hist = hist / np.sum(hist)
+
+    softmin_prob_unnorm = np.exp(bin_edges[1:] / q)
+    softmin_prob = softmin_prob_unnorm / np.sum(softmin_prob_unnorm)
+
+    provable_dist = softmin_prob * (hist / (hist + u))
+    provable_dist = provable_dist / (np.sum(provable_dist) + 1e-7)
+
+    bin_indices = np.digitize(trajectory_returns, bin_edges[1:])
+    hist_prob = hist[np.minimum(bin_indices, bins-1)]
+
+    weights = provable_dist[np.minimum(bin_indices, bins-1)] / (hist_prob + 1e-7)
+    weights = np.clip(weights, a_min=0.0, a_max=max_weight)
+    weights = weights.squeeze()
+
+
+    return weights, len(trajectory_returns)
+
 
 
 class Actor(nn.Module):
@@ -213,8 +323,12 @@ def pipeline(args):
     # ---------------------- Create Dataset ----------------------
     env = gym.make(args.task.env_name)
     # dataset = D4RLMuJoCoTDDataset(d4rl.qlearning_dataset(env), args.normalize_reward) ## TODO normalize reward -- IQL !!
-    dataset = D4RLMuJoCoDataset(
-        env.get_dataset(), horizon=args.task.horizon, terminal_penalty=args.terminal_penalty, discount=args.discount)
+    # dataset = D4RLMuJoCoDataset(
+    #     env.get_dataset(), horizon=args.task.horizon, terminal_penalty=args.terminal_penalty, discount=args.discount)
+    gta_horizon = args.task.horizon -1
+    dataset = GTAD4RLMuJoCoDiffusionDataset(
+        env.get_dataset(), horizon=gta_horizon, terminal_penalty=args.terminal_penalty, discount=args.discount)
+    
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)    
     obs_dim, act_dim = dataset.o_dim, dataset.a_dim
@@ -238,9 +352,17 @@ def pipeline(args):
     print(f"==============================================================================")
 
     # --------------- Diffusion Model Actor --------------------
+    
+    # TODO: loss_weight that has the same shape as the input x as arg of DiscreteDiffusionSDE
+    B, T, D = args.batch_size, args.task.horizon, obs_dim + act_dim + 1
+    loss_mask = torch.ones((B, T, D)).to(args.device)
+    loss_mask[:, -1, obs_dim :] = 0.
+    
+    
     gta = DiscreteDiffusionSDE( ### Mixer 아키텍처가 DDSDE 안으로 들어가 버리면서 conditioning 하는 방법이 바뀌어 버림. -> log["avg_diffusion_loss"] += gta.update(x, val)["loss"]
         nn_diffusion, nn_condition, predict_noise=args.predict_noise, optim_params={"lr": args.diffusion_learning_rate},
-        diffusion_steps=args.diffusion_steps, ema_rate=args.ema_rate, device=args.device) ## TODO (후순위) DDPM -> EDM
+        diffusion_steps=args.diffusion_steps, ema_rate=args.ema_rate, device=args.device, loss_weight=loss_mask) ## TODO (후순위) DDPM -> EDM
+
 
     # ---------------------- Diffusion Training ----------------------
     if args.mode == "train_diffusion":
@@ -265,10 +387,21 @@ def pipeline(args):
             act = batch["act"].to(args.device)
             rew = batch["rew"].to(args.device)
             val = batch["val"].to(args.device) ## val 이 bernoulli에 의해서 drop 되어야 하는가? Ans : NO! 알고보니, diffusionsde의 model forward 입력과 mixerunet의 입력순서가 동일해서 이상무
+            next_obs = batch["next_obs"]["state"].to(args.device)
 
             x = torch.cat([obs, act, rew], -1)
 
+
+            last_obs = next_obs[:, -1, None, :]
+            last_act = torch.zeros_like(act[:, -1, None, :])
+            last_rew = torch.zeros_like(rew[:, -1, None, :])
+            last_transition = torch.cat([last_obs, last_act, last_rew], -1).to(args.device)
+
+            x = torch.cat([x, last_transition], 1)
+            
+            
             # ----------- Gradient Step ------------
+            # TODO: fix loss function not to make loss signal on last action, reward
             log["avg_diffusion_loss"] += gta.update(x, val)["loss"]
             lr_scheduler.step()
 
@@ -294,6 +427,10 @@ def pipeline(args):
         gta.load(save_path + f"diffusion_ckpt_{args.ckpt}.pt")
         gta.eval()
         
+        ## TODO: weighted sampler
+        
+        
+        
         dataloader = DataLoader(
             dataset, batch_size=1000, shuffle=True, num_workers=4, pin_memory=True, drop_last=True ## TODO reweighted sampler 
         )
@@ -308,14 +445,26 @@ def pipeline(args):
             rew = batch["rew"].to(args.device)
             val = batch["val"].to(args.device)
             tml = batch["tml"].to(args.device)
+            next_obs = batch["next_obs"]["state"].to(args.device)
+
+            x = torch.cat([obs, act, rew], -1)
+            
+            last_obs = next_obs[:, -1, None, :]
+            last_act = torch.zeros_like(act[:, -1, None, :])
+            last_rew = torch.zeros_like(rew[:, -1, None, :])
+            last_transition = torch.cat([last_obs, last_act, last_rew], -1).to(args.device)
+
+            original_trajectory = torch.cat([x, last_transition], 1)
+            
             condition = val * args.task.amplified_return_coef
             
-            original_trajectory = torch.cat([obs, act, rew], -1) # 1000, horizon, obs+act+rew
+            # original_trajectory = torch.cat([obs, act, rew], -1) # 1000, horizon, obs+act+rew
             augmented_trajectories, _ = gta.sample(
                             prior, solver=args.solver, n_samples=1000, sample_steps=args.sampling_steps, use_ema=args.use_ema,
                             warm_start_forward_level=args.task.noise_level, warm_start_reference=original_trajectory,
                             condition_cfg=condition, w_cfg=args.w_cfg, temperature=args.temperature
                         )
+            
             augmented_transitions = torch.cat([
                 augmented_trajectories[:, :-1, :], 
                 augmented_trajectories[:, 1:,  :obs_dim],

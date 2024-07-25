@@ -3,9 +3,9 @@ defaults:
   - task: halfcheetah-medium-expert-v2
 
 pipeline_name: gta_d4rl_mujoco_trial
-mode: dataset_upsampling
+mode: train_diffusion
 seed: 0
-device: cuda:1
+device: cuda:7
 
 # Environment
 normalize_reward: True
